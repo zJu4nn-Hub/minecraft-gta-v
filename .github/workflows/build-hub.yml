@@ -1,0 +1,124 @@
+# Build used by the zJu4nn Hub "Mashups" tab.
+# Compiles from this fork's source: the GTA plugin MCPassthrough.asi (MSVC + MinHook + ReShade add-on headers) and the
+# Fabric mod (Gradle on JDK 25). Packs, beside GTA5.exe: the plugin, ReShade 6.8.0 Add-on's runtime (BSD-3, taken
+# from the official installer, pinned by sha256) as ReShade64.asi, the ReShade configuration, the shader and
+# ReShade.fxh (CC0) and the native mapping (generated as upstream's build_release.py does; GPL-2.0 source included).
+# The Hub installs Ultimate ASI Loader from its official release and uses its own shared Prism for Minecraft.
+# Upstream: https://github.com/0RageQuit/minecraft-gta-v (MIT) — all credit to RageQuit, siddoff and justbustin.
+name: build-hub
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag (e.g. hub-v0.1.8-1)"
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-2022
+    env:
+      RESHADE_URL: https://reshade.me/downloads/ReShade_Setup_6.8.0_Addon.exe
+      RESHADE_SETUP_SHA256: afe4c8f13048306307983b8b3d41d5bf00a86820440b0e57dea10950e1176445
+      RESHADE_DLL_SHA256: 0cee63f9c9f13f3ac909c5b4903f4dbb4b719a7ab3b4f13b0deaf83c814b94f7
+      FXH_URL: https://raw.githubusercontent.com/crosire/reshade-shaders/fd0022170615ce0d8162d219bff07232fa6dd84f/Shaders/ReShade.fxh
+      FXH_SHA256: 6dabfbbaf968c3871905d2ea17f96572ff7b1cec01310b5d0e5252b66b30174f
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "25"
+
+      - name: MCPassthrough.asi (MSVC)
+        shell: cmd
+        run: call gta\build.bat
+
+      - name: Fabric mod
+        shell: pwsh
+        run: |
+          $env:GRADLE_USER_HOME = Join-Path (Get-Location) '.tools\gradle-home'
+          .\mc\gradlew.bat -p .\mc --no-daemon --no-configuration-cache build -x test
+
+      - name: ReShade runtime + shader include (pinned)
+        shell: pwsh
+        run: |
+          Invoke-WebRequest $env:RESHADE_URL -OutFile reshade-setup.exe -UserAgent 'Mozilla/5.0'
+          if ((Get-FileHash reshade-setup.exe -Algorithm SHA256).Hash.ToLower() -ne $env:RESHADE_SETUP_SHA256) { throw 'ReShade setup sha256 mismatch' }
+          & 7z e -y reshade-setup.exe ReShade64.dll | Out-Null
+          if ((Get-FileHash ReShade64.dll -Algorithm SHA256).Hash.ToLower() -ne $env:RESHADE_DLL_SHA256) { throw 'ReShade64.dll sha256 mismatch' }
+          Invoke-WebRequest $env:FXH_URL -OutFile ReShade.fxh
+          if ((Get-FileHash ReShade.fxh -Algorithm SHA256).Hash.ToLower() -ne $env:FXH_SHA256) { throw 'ReShade.fxh sha256 mismatch' }
+          Invoke-WebRequest https://raw.githubusercontent.com/crosire/reshade/main/LICENSE.md -OutFile ReShade-LICENSE.txt
+
+      - name: Native mapping (as upstream build_release.py)
+        shell: pwsh
+        run: |
+          @'
+          import re, pathlib
+          P = pathlib.Path('.')
+          pairs = dict(re.findall(r'\{(0x[0-9A-F]+),\s*(0x[0-9A-F]+)\}', (P/'docs/native-mapping/crossmap-original.hpp').read_text()))
+          req = set()
+          for n in ('natives.h', 'native_runtime.hpp', 'native_runtime.cpp'):
+              req.update(re.findall(r'invoke<[^>]+>\((0x[0-9A-F]+)', (P/'gta/src'/n).read_text()))
+          req.add('0x4EDE34FBADD967A6')
+          miss = req - set(pairs)
+          if miss: raise SystemExit('missing native mappings: ' + repr(sorted(miss)))
+          (P/'native-map.csv').write_text(''.join(a + ',' + pairs[a] + '\n' for a in sorted(req)))
+          print(len(req), 'natives mapped')
+          '@ | Set-Content map.py -Encoding utf8
+          python map.py
+
+      - name: Package
+        shell: pwsh
+        run: |
+          $ver = ((Get-Content mc/gradle.properties) | Where-Object { $_ -match '^version=' }) -replace 'version=', ''
+          $jar = Get-ChildItem mc/build/libs -Filter '*.jar' | Where-Object { $_.Name -notmatch 'sources|dev' } | Select-Object -First 1
+          if (!$jar) { throw 'mod jar not found' }
+          $p = 'pkg'
+          $g = "$p/gta"
+          New-Item -ItemType Directory "$g/reshade-shaders/Shaders", "$g/MCPassthrough", "$p/mods", "$p/docs/native-mapping" -Force | Out-Null
+          Copy-Item gta/build/MCPassthrough.asi "$g/MCPassthrough.asi"
+          Copy-Item ReShade64.dll "$g/ReShade64.asi"
+          Copy-Item packaging/gta-config/ReShade.ini "$g/ReShade.ini"
+          Copy-Item packaging/gta-config/ReShadePreset.ini "$g/ReShadePreset.ini"
+          Copy-Item gta/shaders/MCPassthrough.fx "$g/reshade-shaders/Shaders/MCPassthrough.fx"
+          Copy-Item ReShade.fxh "$g/reshade-shaders/Shaders/ReShade.fxh"
+          Copy-Item native-map.csv "$g/MCPassthrough/native-map.csv"
+          Copy-Item $jar.FullName "$p/mods/$($jar.Name)"
+          Copy-Item LICENSE "$p/docs/Minecraft-GTA-V-MIT.txt"
+          Copy-Item gta/third_party/minhook/LICENSE.txt "$p/docs/MinHook-BSD.txt"
+          Copy-Item ReShade-LICENSE.txt "$p/docs/ReShade-LICENSE.txt"
+          Copy-Item docs/native-mapping/crossmap-original.hpp "$p/docs/native-mapping/crossmap-original.hpp"
+          Copy-Item docs/native-mapping/GPL-2.0.txt "$p/docs/native-mapping/GPL-2.0.txt"
+          if (Test-Path mc/src/main/resources/LICENSE-minecraft-ring) { Copy-Item mc/src/main/resources/LICENSE-minecraft-ring "$p/docs/Minecraft-Ring-MIT.txt" }
+          @(
+            "Minecraft x GTA V $ver (build do zJu4nn Hub)",
+            '',
+            'Minecraft de verdade dentro do GTA V Legacy (modo historia). Original de RageQuit',
+            '(github.com/0RageQuit/minecraft-gta-v). Licenca MIT. ReShade (BSD-3), MinHook (BSD-2),',
+            'ReShade.fxh (CC0) e o mapa de nativas (GPL-2.0, fonte em docs/native-mapping) inclusos.',
+            'Projeto de fas, sem ligacao com Rockstar, Take-Two, Mojang ou Microsoft.'
+          ) | Set-Content "$p/LEIA.txt" -Encoding utf8
+          $base = (Resolve-Path $p).Path
+          $sums = Get-ChildItem $p -Recurse -File | ForEach-Object { "$((Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLower())  $($_.FullName.Substring($base.Length + 1).Replace('\','/'))" }
+          $sums | Set-Content "$p/SHA256SUMS.txt" -Encoding ascii
+          $sums
+          Add-Type -AssemblyName System.IO.Compression, System.IO.Compression.FileSystem
+          $zip = "minecraft-gta-v-hub-$ver.zip"
+          $z = [System.IO.Compression.ZipFile]::Open((Join-Path (Get-Location) $zip), 'Create')
+          try { Get-ChildItem $p -Recurse -File | ForEach-Object { [System.IO.Compression.ZipFileExtensions]::CreateEntryFromFile($z, $_.FullName, $_.FullName.Substring($base.Length + 1).Replace('\','/'), 'Optimal') | Out-Null } } finally { $z.Dispose() }
+          "ZIP=$zip" | Out-File $env:GITHUB_ENV -Append -Encoding utf8
+          "VER=$ver" | Out-File $env:GITHUB_ENV -Append -Encoding utf8
+          Get-FileHash $zip -Algorithm SHA256 | Format-List
+
+      - name: Release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${{ inputs.tag }}" $env:ZIP --repo "${{ github.repository }}" --title "Minecraft x GTA V $env:VER (zJu4nn Hub)" --notes "Build of 0RageQuit/minecraft-gta-v $env:VER for the zJu4nn Hub Mashups tab, plugin and Minecraft mod compiled from this fork at ${{ github.sha }}. MIT (bundled: ReShade BSD-3, MinHook BSD-2, ReShade.fxh CC0, native mapping GPL-2.0 with source)."
